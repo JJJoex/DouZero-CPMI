@@ -15,6 +15,38 @@ bombs = [[3, 3, 3, 3], [4, 4, 4, 4], [5, 5, 5, 5], [6, 6, 6, 6],
          [11, 11, 11, 11], [12, 12, 12, 12], [13, 13, 13, 13], [14, 14, 14, 14],
          [17, 17, 17, 17], [20, 30]]
 
+import numpy as np
+from collections import Counter
+Card2Column = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7,
+               11: 8, 12: 9, 13: 10, 14: 11, 17: 12}
+
+NumOnes2Array = {0: np.array([0, 0, 0, 0]),
+                 1: np.array([1, 0, 0, 0]),
+                 2: np.array([1, 1, 0, 0]),
+                 3: np.array([1, 1, 1, 0]),
+                 4: np.array([1, 1, 1, 1])}
+def _cards2array(list_cards):
+    """
+    A utility function that transforms the actions, i.e.,
+    A list of integers into card matrix. Here we remove
+    the six entries that are always zero and flatten the
+    the representations.
+    """
+    if len(list_cards) == 0:
+        return np.zeros(54, dtype=np.int8)
+
+    matrix = np.zeros([4, 13], dtype=np.int8)
+    jokers = np.zeros(2, dtype=np.int8)
+    counter = Counter(list_cards)
+    for card, num_times in counter.items():
+        if card < 20:
+            matrix[:, Card2Column[card]] = NumOnes2Array[num_times]
+        elif card == 20:
+            jokers[0] = 1
+        elif card == 30:
+            jokers[1] = 1
+    return np.concatenate((matrix.flatten('F'), jokers))
+
 class GameEnv(object):
 
     def __init__(self, players):
@@ -52,6 +84,9 @@ class GameEnv(object):
 
         self.bomb_num = 0
         self.last_pid = 'landlord'
+
+        self.history = []
+        self.cpmi_joint_data = []
 
     def card_play_init(self, card_play_data):
         self.info_sets['landlord'].player_hand_cards = \
@@ -104,6 +139,20 @@ class GameEnv(object):
         action = self.players[self.acting_player_position].act(
             self.game_infoset)
         assert action in self.game_infoset.legal_actions
+
+        if len(self.history) < 7:
+            self.history.append(_cards2array(action))
+        else:
+            if self.acting_player_position == 'landlord_down':
+                self.cpmi_joint_data.append(
+                    (self.history[:5], self.history[-2],
+                     _cards2array(action)))
+            elif self.acting_player_position == 'landlord_up':
+                self.cpmi_joint_data.append(
+                    (self.history[1:6], self.history[-1],
+                     _cards2array(action)))
+            self.history.pop(0)
+            self.history.append(_cards2array(action))
 
         if len(action) > 0:
             self.last_pid = self.acting_player_position
@@ -288,6 +337,8 @@ class GameEnv(object):
 
         self.bomb_num = 0
         self.last_pid = 'landlord'
+
+        self.history = []
 
     def get_infoset(self):
         self.info_sets[

@@ -14,6 +14,8 @@ from .file_writer import FileWriter
 from .models import Model
 from .utils import get_batch, log, create_env, create_buffers, create_optimizers, act
 
+from douzero.cpmi.utils import estimate_cpmi, ClassifierModel
+
 mean_episode_return_buf = {p:deque(maxlen=100) for p in ['landlord', 'landlord_up', 'landlord_down']}
 
 def compute_loss(logits, targets):
@@ -23,6 +25,7 @@ def compute_loss(logits, targets):
 def learn(position,
           actor_models,
           model,
+          cpmi_model,
           batch,
           optimizer,
           flags,
@@ -40,10 +43,20 @@ def learn(position,
     target = torch.flatten(batch['target'].to(device), 0, 1)
     episode_returns = batch['episode_return'][batch['done']]
     mean_episode_return_buf[position].append(torch.mean(episode_returns).to(device))
+
+    state = torch.flatten(batch['state'].to(device), 0, 1).float()
         
     with lock:
         learner_outputs = model(obs_z, obs_x, return_value=True)
-        loss = compute_loss(learner_outputs['values'], target)
+        cpmi_reward = 0.0
+        if not position == 'landlord':
+            last_three_moves = obs_z.reshape(32 * 100, -1)[:, -3 * 54 :]
+            if position == 'landlord_up':
+                cpmi_input = torch.cat((obs_x[:, :54], last_three_moves[:, -54:], state), dim=1)
+            else:
+                cpmi_input = torch.cat((obs_x[:, :54], last_three_moves[:, 54:108], state), dim=1)
+            cpmi_reward = 0.05 * estimate_cpmi(cpmi_model, cpmi_input).to(device)
+        loss = compute_loss(learner_outputs['values'] + cpmi_reward, target)
         stats = {
             'mean_episode_return_'+position: torch.mean(torch.stack([_r for _r in mean_episode_return_buf[position]])).item(),
             'loss_'+position: loss.item(),
@@ -143,11 +156,14 @@ def train(flags):
 
     # Starting actor processes
     for device in device_iterator:
-        num_actors = flags.num_actors
+        cpmi_model = ClassifierModel(17*54, 2, 1e-4)
+        cpmi_model.load_state_dict(torch.load('cpmi_model.pth'))
+        cpmi_model.to(torch.device(device))
+        cpmi_model.eval()
         for i in range(flags.num_actors):
             actor = ctx.Process(
                 target=act,
-                args=(i, device, free_queue[device], full_queue[device], models[device], buffers[device], flags))
+                args=(i, device, free_queue[device], full_queue[device], models[device], buffers[device], flags, cpmi_model))
             actor.start()
             actor_processes.append(actor)
 
@@ -155,8 +171,13 @@ def train(flags):
         """Thread target for the learning process."""
         nonlocal frames, position_frames, stats
         while frames < flags.total_frames:
+            cpmi_model = ClassifierModel(17 * 54, 2, 1e-4)
+            cpmi_model.load_state_dict(torch.load('cpmi_model.pth'))
+            cpmi_model.to(torch.device(device))
+            cpmi_model.eval()
+
             batch = get_batch(free_queue[device][position], full_queue[device][position], buffers[device][position], flags, local_lock)
-            _stats = learn(position, models, learner_model.get_model(position), batch, 
+            _stats = learn(position, models, learner_model.get_model(position), cpmi_model, batch, 
                 optimizers[position], flags, position_lock)
 
             with lock:

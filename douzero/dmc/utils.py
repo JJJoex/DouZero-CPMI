@@ -95,6 +95,7 @@ def create_buffers(flags, device_iterator):
                 obs_x_no_action=dict(size=(T, x_dim), dtype=torch.int8),
                 obs_action=dict(size=(T, 54), dtype=torch.int8),
                 obs_z=dict(size=(T, 5, 162), dtype=torch.int8),
+                state=dict(size=(T, 15 * 54), dtype=torch.int8),
             )
             _buffers: Buffers = {key: [] for key in specs}
             for _ in range(flags.num_buffers):
@@ -107,7 +108,7 @@ def create_buffers(flags, device_iterator):
             buffers[device][position] = _buffers
     return buffers
 
-def act(i, device, free_queue, full_queue, model, buffers, flags):
+def act(i, device, free_queue, full_queue, model, buffers, flags, cpmi_model=None):
     """
     This function will run forever until we stop it. It will generate
     data from the environment and send the data to buffer. It uses
@@ -128,15 +129,37 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
         obs_action_buf = {p: [] for p in positions}
         obs_z_buf = {p: [] for p in positions}
         size = {p: 0 for p in positions}
+        state_buf = {p: [] for p in positions} 
 
         position, obs, env_output = env.initial()
 
         while True:
+            _state = [torch.zeros(15 * 54, dtype=torch.int8)]
+            pass_times = 0
+            is_new_round = True
             while True:
                 obs_x_no_action_buf[position].append(env_output['obs_x_no_action'])
                 obs_z_buf[position].append(env_output['obs_z'])
+                state_buf['landlord'].append(torch.zeros(15 * 54, dtype=torch.int8))
                 with torch.no_grad():
-                    agent_output = model.forward(position, obs['z_batch'], obs['x_batch'], flags=flags)
+                    if position == 'landlord':
+                        agent_output = model.forward(position, obs['z_batch'], obs['x_batch'], flags=flags)
+                    else:
+                        _state.append(env_output['obs_z'].reshape(15 * 54))
+                        _state = _state[-2:]
+                        state_buf[position].append(_state[0])
+                        if is_new_round:
+                            agent_output = model.forward(position, obs['z_batch'], obs['x_batch'], flags=flags)
+                            is_new_round = False
+                        else:
+                            if position == 'landlord_up':
+                                last_peasant = 'landlord_down'
+                                cpmi_input = torch.cat([obs_action_buf[last_peasant][-1], obs_z_buf[last_peasant][-1].reshape(-1)], dim=0)
+                            elif len(obs_action_buf[position]) != 0:
+                                last_peasant = 'landlord_up'
+                                cpmi_input = torch.cat([obs_action_buf[last_peasant][-1], obs_z_buf[last_peasant][-1].reshape(-1)], dim=0)
+                            agent_output = model.forward(position, obs['z_batch'], obs['x_batch'], cpmi_model, cpmi_input, flags=flags)
+
                 _action_idx = int(agent_output['action'].cpu().detach().numpy())
                 action = obs['legal_actions'][_action_idx]
                 obs_action_buf[position].append(_cards2tensor(action))
@@ -155,6 +178,12 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                             target_buf[p].extend([episode_return for _ in range(diff)])
                     break
 
+                if len(action) == 0:
+                    pass_times += 1
+                    is_new_round = True if pass_times == 2 else False
+                else:
+                    pass_times = 0
+
             for p in positions:
                 while size[p] > T: 
                     index = free_queue[p].get()
@@ -167,6 +196,7 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                         buffers[p]['obs_x_no_action'][index][t, ...] = obs_x_no_action_buf[p][t]
                         buffers[p]['obs_action'][index][t, ...] = obs_action_buf[p][t]
                         buffers[p]['obs_z'][index][t, ...] = obs_z_buf[p][t]
+                        buffers[p]['state'][index][t, ...] = state_buf[p][t]
                     full_queue[p].put(index)
                     done_buf[p] = done_buf[p][T:]
                     episode_return_buf[p] = episode_return_buf[p][T:]
@@ -175,6 +205,7 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                     obs_action_buf[p] = obs_action_buf[p][T:]
                     obs_z_buf[p] = obs_z_buf[p][T:]
                     size[p] -= T
+                    state_buf[p] = state_buf[p][T:]
 
     except KeyboardInterrupt:
         pass  

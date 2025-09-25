@@ -7,6 +7,7 @@ import numpy as np
 
 import torch
 from torch import nn
+from douzero.cpmi.utils import estimate_cpmi
 
 class LandlordLstmModel(nn.Module):
     def __init__(self):
@@ -54,7 +55,8 @@ class FarmerLstmModel(nn.Module):
         self.dense5 = nn.Linear(512, 512)
         self.dense6 = nn.Linear(512, 1)
 
-    def forward(self, z, x, return_value=False, flags=None):
+    def forward(self, z, x, cpmi_model=None, cpmi_input=None, return_value=False, flags=None):
+        actions = x[:, -54:]
         lstm_out, (h_n, _) = self.lstm(z)
         lstm_out = lstm_out[:,-1,:]
         x = torch.cat([lstm_out,x], dim=-1)
@@ -75,6 +77,12 @@ class FarmerLstmModel(nn.Module):
             if flags is not None and flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon:
                 action = torch.randint(x.shape[0], (1,))[0]
             else:
+                if cpmi_input is not None:
+                    cpmi_input = cpmi_input.to(x.device)
+                    cpmi_input = torch.cat([actions, cpmi_input.expand(x.size(0), -1)], dim=1)
+                    cpmi_reward = estimate_cpmi(cpmi_model, cpmi_input)
+                    coef = (2 * (torch.max(x).item() - torch.min(x).item()) / x.size(0)) / (torch.max(cpmi_reward).item() - torch.min(cpmi_reward).item() + 1e-6)
+                    x += coef * cpmi_reward
                 action = torch.argmax(x,dim=0)[0]
             return dict(action=action)
 
@@ -96,10 +104,13 @@ class Model:
         self.models['landlord'] = LandlordLstmModel().to(torch.device(device))
         self.models['landlord_up'] = FarmerLstmModel().to(torch.device(device))
         self.models['landlord_down'] = FarmerLstmModel().to(torch.device(device))
-
-    def forward(self, position, z, x, training=False, flags=None):
+    
+    def forward(self, position, z, x, cpmi_model=None, cpmi_input=None, training=False, flags=None):
         model = self.models[position]
-        return model.forward(z, x, training, flags)
+        if position == 'landlord':
+            return model.forward(z, x,  training, flags)
+        else:
+            return model.forward(z, x, cpmi_model, cpmi_input, training, flags)
 
     def share_memory(self):
         self.models['landlord'].share_memory()
